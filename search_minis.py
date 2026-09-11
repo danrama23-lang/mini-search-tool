@@ -1,15 +1,18 @@
 """
-AutoTrader MINI Cooper Convertible search tool.
+AutoTrader MINI Cooper S Convertible search tool.
 
-Searches for used 2022-2025 MINI Cooper Convertibles with automatic
-transmission, under $30,000, under 40,000 miles, within 500 miles of 95008.
-Prints a table to the terminal and saves a timestamped CSV.
+Searches for used 2019-2025 MINI Cooper S Convertibles with automatic
+transmission, under $30,000, under 60,000 miles, within 500 miles of 95008.
+Prints a table to the terminal, saves a timestamped CSV, and opens an HTML
+results page with car photos and clickable listing links.
 """
 
 import csv
 import json
+import os
 import sys
 import time
+import webbrowser
 from datetime import datetime
 from urllib.parse import urlencode
 
@@ -20,7 +23,7 @@ from tabulate import tabulate
 # ── Search parameters ──────────────────────────────────────────────────────────
 SEARCH = {
     "makeCode": "MINI",
-    "vehicleStyleCode": "CONVERTIBLE",
+    "vehicleStyleCode": "CONVERT",
     "startYear": 2019,
     "endYear": 2025,
     "transmissionCode": "AUT",  # AutoTrader's code for Automatic (not "A")
@@ -32,9 +35,6 @@ SEARCH = {
     "sortBy": "distanceASC",
     "numRecords": 25,           # AutoTrader max per page
 }
-
-# Post-fetch filter: only keep trim names that indicate a Cooper S
-REQUIRE_S_TRIM = True
 
 BASE_URL = "https://www.autotrader.com"
 SEARCH_URL = f"{BASE_URL}/cars-for-sale/used-cars"
@@ -54,20 +54,53 @@ HEADERS = {
     "Sec-Fetch-User": "?1",
 }
 
+PLACEHOLDER_IMG = (
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='320' "
+    "height='213' viewBox='0 0 320 213'%3E%3Crect width='320' height='213' "
+    "fill='%23e0e0e0'/%3E%3Ctext x='50%25' y='50%25' dominant-baseline='middle' "
+    "text-anchor='middle' font-family='sans-serif' font-size='14' fill='%23999'"
+    "%3ENo image%3C/text%3E%3C/svg%3E"
+)
+
 
 def build_url(offset: int) -> str:
     params = {**SEARCH, "firstRecord": offset}
     return f"{SEARCH_URL}?{urlencode(params)}"
 
 
-def is_cooper_s(item: dict) -> bool:
-    """Return True if the listing trim indicates a Cooper S (not base, JCW, or SE)."""
+def is_cooper_s_convertible(item: dict) -> bool:
+    """Return True only for base Cooper S in a confirmed convertible body style."""
     trim_raw = item.get("trim", {})
     trim = trim_raw.get("name", "") if isinstance(trim_raw, dict) else str(trim_raw)
     model_raw = item.get("model", {})
     model = model_raw.get("name", "") if isinstance(model_raw, dict) else str(model_raw)
-    # Only the base "Cooper" (exact match) — excludes Countryman, Clubman, Paceman, etc.
-    return model.strip() == "Cooper" and trim.strip() == "S"
+
+    # Must be base Cooper (not Countryman, Clubman, etc.) with S trim
+    if not (model.strip() == "Cooper" and trim.strip() == "S"):
+        return False
+
+    # Reject anything AutoTrader explicitly tags as a non-convertible body style.
+    # We don't require "CONVERT" because AutoTrader's bodyStyles field is inconsistent
+    # — many genuine convertibles are tagged "HATCH". The search URL's
+    # vehicleStyleCode=CONVERTIBLE is the primary filter; this just catches stragglers
+    # clearly tagged as SUV, wagon, etc.
+    NON_CONVERTIBLE = {"SUV", "TRUCK", "VAN", "WAGON", "SEDAN"}
+    body_styles = item.get("bodyStyles", [])
+    if isinstance(body_styles, list) and body_styles:
+        code = body_styles[0].get("code", "") if isinstance(body_styles[0], dict) else ""
+        if code in NON_CONVERTIBLE:
+            return False
+
+    return True
+
+
+def get_image_url(item: dict) -> str:
+    images = item.get("images", {})
+    if isinstance(images, dict):
+        sources = images.get("sources", [])
+        if sources and isinstance(sources[0], dict):
+            return sources[0].get("src", PLACEHOLDER_IMG)
+    return PLACEHOLDER_IMG
 
 
 def fetch(url: str, session: requests.Session) -> requests.Response | None:
@@ -120,7 +153,7 @@ def parse_page(html: str) -> tuple[list[dict], int]:
         item = inventory.get(str(lid))
         if item is None:
             continue
-        if REQUIRE_S_TRIM and not is_cooper_s(item):
+        if not is_cooper_s_convertible(item):
             continue
         try:
             year = item.get("year", "")
@@ -144,7 +177,6 @@ def parse_page(html: str) -> tuple[list[dict], int]:
                 else str(mileage_raw or "N/A")
             )
 
-            # Location comes from the owners table
             owner_id = str(item.get("ownerId", ""))
             owner = owners.get(owner_id, {})
             addr = owner.get("location", {}).get("address", {})
@@ -153,8 +185,9 @@ def parse_page(html: str) -> tuple[list[dict], int]:
             location = f"{city}, {state}".strip(", ") or item.get("ownerName", "N/A")
 
             vdp = item.get("vdpBaseUrl", "")
-            # Strip search-context query params — keep just the listing ID segment
             link = BASE_URL + vdp.split("?")[0] if vdp else "N/A"
+
+            image_url = get_image_url(item)
 
             listings.append({
                 "Year": year,
@@ -163,6 +196,7 @@ def parse_page(html: str) -> tuple[list[dict], int]:
                 "Mileage": mileage,
                 "Location": location,
                 "Link": link,
+                "Image": image_url,
             })
         except Exception:
             continue
@@ -213,7 +247,7 @@ def run_search(session: requests.Session) -> list[dict]:
             break
 
         page += 1
-        time.sleep(1.5)  # polite pause between pages
+        time.sleep(1.5)
 
     return all_listings
 
@@ -225,7 +259,67 @@ def save_csv(listings: list[dict]) -> str:
     with open(filename, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        w.writerows(listings)
+        w.writerows({k: v for k, v in r.items() if k != "Image"} for r in listings)
+    return filename
+
+
+def save_html(listings: list[dict], timestamp: str) -> str:
+    filename = f"results_{timestamp}.html"
+
+    cards = ""
+    for r in listings:
+        cards += f"""
+        <div class="card">
+            <a href="{r['Link']}" target="_blank">
+                <img src="{r['Image']}" alt="{r['Model']}" loading="lazy">
+            </a>
+            <div class="info">
+                <div class="title">{r['Year']} {r['Model']}</div>
+                <div class="price">{r['Price']}</div>
+                <div class="detail">{r['Mileage']} miles &nbsp;|&nbsp; {r['Location']}</div>
+                <a class="btn" href="{r['Link']}" target="_blank">View Listing</a>
+            </div>
+        </div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MINI Cooper S Convertible Results</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          background: #f4f4f4; color: #222; padding: 24px; }}
+  h1 {{ font-size: 1.5rem; margin-bottom: 4px; }}
+  .meta {{ color: #666; font-size: 0.9rem; margin-bottom: 24px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+           gap: 20px; }}
+  .card {{ background: #fff; border-radius: 10px; overflow: hidden;
+           box-shadow: 0 2px 8px rgba(0,0,0,0.08); transition: transform .15s; }}
+  .card:hover {{ transform: translateY(-3px); box-shadow: 0 6px 16px rgba(0,0,0,0.12); }}
+  .card img {{ width: 100%; height: 190px; object-fit: cover; display: block; }}
+  .info {{ padding: 14px; }}
+  .title {{ font-weight: 600; font-size: 1rem; margin-bottom: 4px; }}
+  .price {{ font-size: 1.2rem; font-weight: 700; color: #1a73e8; margin-bottom: 6px; }}
+  .detail {{ font-size: 0.85rem; color: #555; margin-bottom: 12px; }}
+  .btn {{ display: inline-block; background: #1a73e8; color: #fff; padding: 8px 16px;
+          border-radius: 6px; text-decoration: none; font-size: 0.875rem; font-weight: 500; }}
+  .btn:hover {{ background: #1558b0; }}
+</style>
+</head>
+<body>
+<h1>MINI Cooper S Convertible — Search Results</h1>
+<p class="meta">{len(listings)} listings &nbsp;|&nbsp; 2019-2025 &nbsp;|&nbsp;
+  Auto &nbsp;|&nbsp; &le;$30,000 &nbsp;|&nbsp; &le;60,000 mi &nbsp;|&nbsp;
+  within 500 mi of 95008 &nbsp;|&nbsp; Generated {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
+<div class="grid">{cards}
+</div>
+</body>
+</html>"""
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(html)
     return filename
 
 
@@ -243,7 +337,6 @@ def print_table(listings: list[dict]) -> None:
 
 
 def main() -> None:
-    # Windows terminals default to cp1252; force UTF-8 so table borders render.
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -267,8 +360,15 @@ def main() -> None:
     print(f"\nTotal listings retrieved: {len(listings)}")
     print_table(listings)
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     csv_file = save_csv(listings)
-    print(f"\nSaved to: {csv_file}")
+    print(f"\nCSV saved to:  {csv_file}")
+
+    html_file = save_html(listings, timestamp)
+    print(f"HTML saved to: {html_file}")
+
+    webbrowser.open(f"file:///{os.path.abspath(html_file)}")
 
 
 if __name__ == "__main__":
